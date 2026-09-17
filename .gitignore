@@ -1,0 +1,7 @@
+app/node_modules
+app/.next
+app/.env.local
+contracts/lib
+contracts/out
+contracts/cache
+.DS_Store
