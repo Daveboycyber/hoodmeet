@@ -1,14 +1,38 @@
 "use client";
+
+import { useState } from "react";
+import { useAccount } from "wagmi";
+import { useRouter } from "next/navigation";
 import ConnectButton from "../components/ConnectButton";
-import CreateRoom from "../components/CreateRoom";
+
 export default function Home() {
+  const { isConnected } = useAccount();
+  const router = useRouter();
+  const [slug, setSlug] = useState("");
+
+  function go(e) {
+    e.preventDefault();
+    const id = slug.toLowerCase().replace(/[^a-z0-9-]/g, "") || "demo";
+    router.push(`/room/${id}`);
+  }
+
   return (
-    <div className="wrap">
-      <nav className="nav"><a className="brand" href="/">Hood<span>Meet</span></a><ConnectButton /></nav>
-      <span className="badge">Robinhood Chain · testnet 46630</span>
-      <h1>Video rooms that settle on-chain.</h1>
-      <p className="lede">Wallet login. Paid and token-gated rooms in MEET. Media is peer-to-peer.</p>
-      <div className="grid"><CreateRoom /><div className="card"><h2>Flywheel (MVP)</h2><p className="lede" style={{fontSize:15,margin:0}}>Open rooms free. Paid rooms pull MEET. Host closes → 90% host, 10% treasury.</p></div></div>
+    <div className="join">
+      <div className="join-card">
+        <div className="logo"><i>H</i> HoodMeet</div>
+        <h1>Join a meeting</h1>
+        <p>Simple video rooms on Robinhood Chain</p>
+        <form onSubmit={go}>
+          <label>Meeting ID</label>
+          <input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="Enter meeting ID" required minLength={3} />
+          <div className="actions">
+            <button className="btn-blue" type="submit">Join</button>
+            <button className="btn-ghost" type="submit">Host a meeting</button>
+          </div>
+        </form>
+        <div className="wallet"><ConnectButton /></div>
+        {!isConnected && <p className="wallet">Connect a wallet to host a paid or token-gated room.</p>}
+      </div>
     </div>
   );
 }
