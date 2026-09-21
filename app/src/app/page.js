@@ -1,19 +1,16 @@
 "use client";
 
 import { useState } from "react";
-import { useAccount } from "wagmi";
 import { useRouter } from "next/navigation";
-import ConnectButton from "../components/ConnectButton";
 
 export default function Home() {
-  const { isConnected } = useAccount();
   const router = useRouter();
   const [slug, setSlug] = useState("");
 
   function go(e) {
     e.preventDefault();
     const id = slug.toLowerCase().replace(/[^a-z0-9-]/g, "") || "demo";
-    router.push(`/room/${id}`);
+    router.push("/room/" + id);
   }
 
   return (
@@ -21,7 +18,7 @@ export default function Home() {
       <div className="join-card">
         <div className="logo"><i>H</i> HoodMeet</div>
         <h1>Join a meeting</h1>
-        <p>Simple video rooms on Robinhood Chain</p>
+        <p>Simple video rooms</p>
         <form onSubmit={go}>
           <label>Meeting ID</label>
           <input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="Enter meeting ID" required minLength={3} />
@@ -30,8 +27,6 @@ export default function Home() {
             <button className="btn-ghost" type="submit">Host a meeting</button>
           </div>
         </form>
-        <div className="wallet"><ConnectButton /></div>
-        {!isConnected && <p className="wallet">Connect a wallet to host a paid or token-gated room.</p>}
       </div>
     </div>
   );
