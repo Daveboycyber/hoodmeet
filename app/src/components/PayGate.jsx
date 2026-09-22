@@ -1,11 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { decodeFunctionResult } from "viem";
+import { decodeFunctionResult, encodeFunctionData } from "viem";
 import { approveMeet, call, joinRoom, slugId } from "../lib/eth";
 import { roomAbi } from "../abi/RoomRegistry";
 import { CONTRACTS } from "../lib/chain";
-import { encodeFunctionData } from "viem";
 
 export default function PayGate({ slug, children }) {
   const [paid, setPaid] = useState(false);
@@ -18,6 +17,7 @@ export default function PayGate({ slug, children }) {
     (async () => {
       try {
         if (!window.ethereum) return;
+        const acc = (await window.ethereum.request({ method: "eth_accounts" }))[0] || "";
         const n = await slugId(slug);
         if (!live || n === 0n) return;
         setId(n);
@@ -25,7 +25,8 @@ export default function PayGate({ slug, children }) {
         const raw = await call(CONTRACTS.rooms, data);
         const room = decodeFunctionResult({ abi: roomAbi, functionName: "rooms", data: raw });
         const access = Number(room.access ?? room[3]);
-        if (live) setPaid(access === 1);
+        const host = String(room.host ?? room[0] || "").toLowerCase();
+        if (live) setPaid(access === 1 && host !== acc.toLowerCase());
       } catch {
         /* stay open */
       }
