@@ -15,6 +15,8 @@ export default function VideoRoom({ roomId }) {
 
   useEffect(() => {
     let dead = false;
+    let retry;
+
     function upsert(id, stream, call) {
       peersRef.current.set(id, { id, stream, call });
       setPeers(Array.from(peersRef.current.values()));
@@ -28,6 +30,7 @@ export default function VideoRoom({ roomId }) {
       call.on("close", () => drop(call.peer));
       call.on("error", () => drop(call.peer));
     }
+
     async function boot() {
       try {
         setStatus("camera");
@@ -38,9 +41,11 @@ export default function VideoRoom({ roomId }) {
         }
         streamRef.current = stream;
         if (localRef.current) localRef.current.srcObject = stream;
+
         const { default: Peer } = await import("peerjs");
-        const hostId = `hm-${roomId}`.slice(0, 50);
+        const hostId = ("hm-" + roomId).slice(0, 50);
         setStatus("signaling");
+
         const asHost = new Peer(hostId);
         asHost.on("open", () => {
           if (dead) return;
@@ -59,13 +64,19 @@ export default function VideoRoom({ roomId }) {
           }
           asHost.destroy();
           const guest = new Peer();
-          guest.on("open", () => {
-            if (dead) return;
-            peerRef.current = guest;
-            setRole("guest");
-            setStatus("live");
+          peerRef.current = guest;
+          function dial() {
             const call = guest.call(hostId, stream);
             if (call) hook(call);
+          }
+          guest.on("open", () => {
+            if (dead) return;
+            setRole("guest");
+            setStatus("live");
+            dial();
+            retry = setInterval(() => {
+              if (peersRef.current.size === 0 && !dead) dial();
+            }, 2500);
           });
           guest.on("call", (call) => {
             call.answer(stream);
@@ -77,9 +88,11 @@ export default function VideoRoom({ roomId }) {
         setStatus(e.message || "media error");
       }
     }
+
     boot();
     return () => {
       dead = true;
+      clearInterval(retry);
       streamRef.current?.getTracks().forEach((t) => t.stop());
       peerRef.current?.destroy();
     };
@@ -108,8 +121,13 @@ export default function VideoRoom({ roomId }) {
           <div className="tag">You · {role || status}</div>
         </div>
         {peers.map((p) => (
-          <Remote key={p.id} stream={p.stream} label={p.id.slice(0, 16)} />
+          <Remote key={p.id} stream={p.stream} label={p.id.slice(0, 12)} />
         ))}
+        {peers.length === 0 && (
+          <div className="tile">
+            <div className="tag">Waiting for the other window…</div>
+          </div>
+        )}
       </div>
       <div className="dock">
         <button className={muted ? "ctrl off" : "ctrl"} onClick={toggleMute}>{muted ? "Mic off" : "Mic"}</button>
@@ -123,11 +141,14 @@ export default function VideoRoom({ roomId }) {
 function Remote({ stream, label }) {
   const ref = useRef(null);
   useEffect(() => {
-    if (ref.current) ref.current.srcObject = stream;
+    if (ref.current) {
+      ref.current.srcObject = stream;
+      ref.current.play().catch(() => {});
+    }
   }, [stream]);
   return (
     <div className="tile">
-      <video ref={ref} autoPlay playsInline />
+      <video ref={ref} autoPlay playsInline muted />
       <div className="tag">{label}</div>
     </div>
   );
