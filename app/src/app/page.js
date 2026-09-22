@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import ConnectButton from "../components/ConnectButton";
 
 export default function Home() {
   const router = useRouter();
@@ -18,7 +19,7 @@ export default function Home() {
       <div className="join-card">
         <div className="logo"><i>H</i> HoodMeet</div>
         <h1>Join a meeting</h1>
-        <p>Simple video rooms</p>
+        <p>Simple video rooms on Robinhood Chain</p>
         <form onSubmit={go}>
           <label>Meeting ID</label>
           <input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="Enter meeting ID" required minLength={3} />
@@ -27,6 +28,7 @@ export default function Home() {
             <button className="btn-ghost" type="submit">Host a meeting</button>
           </div>
         </form>
+        <div className="wallet"><ConnectButton /></div>
       </div>
     </div>
   );
