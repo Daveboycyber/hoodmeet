@@ -11,8 +11,10 @@ export default function RoomPage() {
   return (
     <div className="meet">
       <div className="topbar">
-        <div><strong>{slug}</strong></div>
-        <div className="meta"><ConnectButton /></div>
+        <div className="room-id">{slug}</div>
+        <div className="meta">
+          <ConnectButton />
+        </div>
       </div>
       <PayGate slug={slug}>
         <VideoRoom roomId={slug} />
