@@ -25,6 +25,40 @@ function canScreenShare() {
   return !/Android|iPhone|iPad|iPod/i.test(navigator.userAgent || "");
 }
 
+// STUN + public TURN so guest↔guest works behind NAT (default PeerJS is STUN-only)
+var ICE_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+    {
+      urls: "turn:openrelay.metered.ca:80",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+    {
+      urls: "turn:openrelay.metered.ca:443?transport=tcp",
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+  ],
+};
+
+function createPeer(id) {
+  var opts = { debug: 1, config: ICE_CONFIG };
+  if (id) return new (requirePeer())(id, opts);
+  return new (requirePeer())(opts);
+}
+
+var PeerCtor = null;
+function requirePeer() {
+  return PeerCtor;
+}
+
 export default function VideoRoom({ roomId }) {
   const localRef = useRef(null);
   const [peers, setPeers] = useState([]);
@@ -41,6 +75,7 @@ export default function VideoRoom({ roomId }) {
   const [wallet, setWallet] = useState("");
   const [mediaNote, setMediaNote] = useState("");
   const [shareHint, setShareHint] = useState("");
+  const [peerCount, setPeerCount] = useState(0);
   const streamRef = useRef(null);
   const camStreamRef = useRef(null);
   const peerRef = useRef(null);
@@ -52,6 +87,7 @@ export default function VideoRoom({ roomId }) {
   const handRef = useRef(false);
   const sharingRef = useRef(false);
   const lastSeenRef = useRef(new Map());
+  const dialingRef = useRef(new Set());
 
   useEffect(() => {
     if (typeof window !== "undefined" && window.ethereum) {
@@ -67,11 +103,13 @@ export default function VideoRoom({ roomId }) {
     var meshTick;
 
     function publishPeers() {
-      setPeers(Array.from(peersRef.current.values()));
+      var list = Array.from(peersRef.current.values());
+      setPeers(list);
+      setPeerCount(list.length);
     }
 
     function isHost() {
-      return myIdRef.current && myIdRef.current === hostIdRef.current;
+      return !!myIdRef.current && myIdRef.current === hostIdRef.current;
     }
 
     function broadcast(msg) {
@@ -89,6 +127,10 @@ export default function VideoRoom({ roomId }) {
       rosterRef.current.forEach(function (id) {
         if (id && ids.indexOf(id) === -1) ids.push(id);
       });
+      // include anyone we already have media with
+      peersRef.current.forEach(function (_v, id) {
+        if (id && ids.indexOf(id) === -1) ids.push(id);
+      });
       return ids;
     }
 
@@ -98,13 +140,7 @@ export default function VideoRoom({ roomId }) {
 
     function drop(id) {
       if (!id || id === myIdRef.current) return;
-      var had =
-        peersRef.current.has(id) ||
-        callsRef.current.has(id) ||
-        connsRef.current.has(id) ||
-        rosterRef.current.has(id);
-      if (!had) return;
-
+      dialingRef.current.delete(id);
       try {
         var call = callsRef.current.get(id);
         if (call) call.close();
@@ -113,13 +149,11 @@ export default function VideoRoom({ roomId }) {
         var conn = connsRef.current.get(id);
         if (conn) conn.close();
       } catch (e) {}
-
       peersRef.current.delete(id);
       callsRef.current.delete(id);
       connsRef.current.delete(id);
       rosterRef.current.delete(id);
       lastSeenRef.current.delete(id);
-
       setHands(function (h) {
         var n = Object.assign({}, h);
         delete n[id];
@@ -134,7 +168,6 @@ export default function VideoRoom({ roomId }) {
         return cur === id ? null : cur;
       });
       publishPeers();
-
       if (isHost()) broadcastRoster();
     }
 
@@ -146,17 +179,21 @@ export default function VideoRoom({ roomId }) {
       if (!id || id === myIdRef.current) return;
       touch(id);
       rosterRef.current.add(id);
-      var prev = peersRef.current.get(id) || {};
-      peersRef.current.set(id, Object.assign({}, prev, { id: id, stream: stream }));
+      dialingRef.current.delete(id);
+      peersRef.current.set(id, { id: id, stream: stream });
       publishPeers();
+      if (isHost()) broadcastRoster();
     }
 
     function watchPc(id, pc) {
       if (!pc) return;
       function check() {
         var s = pc.connectionState || pc.iceConnectionState;
-        if (s === "failed" || s === "closed") drop(id);
-        else if (s === "connected" || s === "completed") touch(id);
+        if (s === "failed" || s === "closed") {
+          callsRef.current.delete(id);
+          // allow re-dial
+          dialingRef.current.delete(id);
+        } else if (s === "connected" || s === "completed") touch(id);
       }
       try {
         pc.addEventListener("connectionstatechange", check);
@@ -164,10 +201,16 @@ export default function VideoRoom({ roomId }) {
       } catch (e) {}
     }
 
-    // Only the lower peer id initiates the media call (avoids glare).
-    // Both sides still answer inbound calls.
+    /**
+     * Media call rules:
+     * - Every guest always calls the host (host only answers).
+     * - Guest↔guest: only the lexicographically smaller id calls (avoids glare).
+     * - Host never initiates media calls.
+     */
     function shouldInitiateCall(remoteId) {
       if (!myIdRef.current || !remoteId) return false;
+      if (remoteId === hostIdRef.current) return true;
+      if (isHost()) return false;
       return myIdRef.current < remoteId;
     }
 
@@ -177,8 +220,7 @@ export default function VideoRoom({ roomId }) {
       var existing = connsRef.current.get(peerId);
       if (existing && existing.open) return;
       try {
-        var conn = me.connect(peerId, { reliable: true });
-        wireConn(conn);
+        wireConn(me.connect(peerId, { reliable: true }));
       } catch (e) {}
     }
 
@@ -188,10 +230,19 @@ export default function VideoRoom({ roomId }) {
       if (!streamRef.current) return;
       if (callsRef.current.has(peerId)) return;
       if (!shouldInitiateCall(peerId)) return;
+      if (dialingRef.current.has(peerId)) return;
+      dialingRef.current.add(peerId);
       try {
         var call = me.call(peerId, streamRef.current);
         if (call) hookCall(call);
-      } catch (e) {}
+        else dialingRef.current.delete(peerId);
+      } catch (e) {
+        dialingRef.current.delete(peerId);
+      }
+      // allow retry later if no stream arrives
+      setTimeout(function () {
+        if (!peersRef.current.has(peerId)) dialingRef.current.delete(peerId);
+      }, 8000);
     }
 
     function dialPeer(peerId) {
@@ -205,7 +256,6 @@ export default function VideoRoom({ roomId }) {
       rosterRef.current.forEach(function (id) {
         dialPeer(id);
       });
-      // always keep link to room host id
       if (hostIdRef.current && hostIdRef.current !== myIdRef.current) {
         dialPeer(hostIdRef.current);
       }
@@ -243,8 +293,7 @@ export default function VideoRoom({ roomId }) {
             dialPeer(id);
           }
         });
-        // Only trust removals from the room host's roster
-        if (msg.host || from === hostIdRef.current) {
+        if (msg.host === true || from === hostIdRef.current) {
           var keep = {};
           msg.ids.forEach(function (id) {
             if (id) keep[id] = true;
@@ -262,7 +311,6 @@ export default function VideoRoom({ roomId }) {
           rosterRef.current.add(msg.id);
           dialPeer(msg.id);
         }
-        // host rebroadcasts full list so every guest learns every guest
         if (isHost()) broadcastRoster();
         return;
       }
@@ -343,14 +391,10 @@ export default function VideoRoom({ roomId }) {
           if (sharingRef.current) conn.send(JSON.stringify({ type: "share", on: true }));
         } catch (e) {}
         if (isHost()) broadcastRoster();
-        // After data is up, try media both directions as rules allow
         dialPeer(pid);
       });
       conn.on("close", function () {
-        drop(pid);
-      });
-      conn.on("error", function () {
-        // soft: mesh tick will retry
+        connsRef.current.delete(pid);
       });
     }
 
@@ -372,13 +416,14 @@ export default function VideoRoom({ roomId }) {
         upsert(pid, remote);
       });
       call.on("close", function () {
-        // keep roster; mesh tick may re-call. Only drop tile stream.
-        peersRef.current.delete(pid);
         callsRef.current.delete(pid);
+        dialingRef.current.delete(pid);
+        peersRef.current.delete(pid);
         publishPeers();
       });
       call.on("error", function () {
         callsRef.current.delete(pid);
+        dialingRef.current.delete(pid);
       });
     }
 
@@ -389,20 +434,20 @@ export default function VideoRoom({ roomId }) {
         myIdRef.current = id;
         setRole(asHost ? "host" : "guest");
         setStatus("live");
-        if (!asHost) {
-          dialPeer(hostIdRef.current);
-        }
+        if (!asHost) dialPeer(hostIdRef.current);
       });
       p.on("connection", function (conn) {
         wireConn(conn);
       });
       p.on("call", function (call) {
-        // Always answer so we receive their stream and send ours
         try {
           call.answer(streamRef.current || new MediaStream());
         } catch (e) {}
         hookCall(call);
         ensureData(call.peer);
+        // learn this peer and tell others
+        rosterRef.current.add(call.peer);
+        if (isHost()) broadcastRoster();
       });
       p.on("disconnected", function () {
         try {
@@ -444,12 +489,12 @@ export default function VideoRoom({ roomId }) {
       if (localRef.current) localRef.current.srcObject = stream;
 
       var PeerMod = await import("peerjs");
-      var Peer = PeerMod.default;
+      PeerCtor = PeerMod.default;
       var hostId = ("hm-" + String(roomId)).slice(0, 50);
       hostIdRef.current = hostId;
       setStatus("signaling");
 
-      var asHost = new Peer(hostId);
+      var asHost = new PeerCtor(hostId, { debug: 1, config: ICE_CONFIG });
       asHost.on("error", function (err) {
         if (!err || err.type !== "unavailable-id") {
           setStatus(String((err && err.type) || err || "error"));
@@ -458,7 +503,7 @@ export default function VideoRoom({ roomId }) {
         try {
           asHost.destroy();
         } catch (e) {}
-        var guest = new Peer();
+        var guest = new PeerCtor({ debug: 1, config: ICE_CONFIG });
         attachPeer(guest, false);
         guest.on("open", function () {
           dialPeer(hostId);
@@ -472,7 +517,6 @@ export default function VideoRoom({ roomId }) {
       });
       attachPeer(asHost, true);
 
-      // Keep mesh healthy: re-dial missing links, expire silent peers
       meshTick = setInterval(function () {
         if (dead) return;
         broadcast({ type: "ping" });
@@ -480,9 +524,9 @@ export default function VideoRoom({ roomId }) {
         meshAll();
         var now = Date.now();
         lastSeenRef.current.forEach(function (ts, id) {
-          if (now - ts > 20000) drop(id);
+          if (now - ts > 25000) drop(id);
         });
-      }, 5000);
+      }, 4000);
 
       window.addEventListener("pagehide", announceLeave);
       window.addEventListener("beforeunload", announceLeave);
@@ -736,6 +780,9 @@ export default function VideoRoom({ roomId }) {
         <button type="button" className="ctrl leave" onClick={leaveRoom}>
           Leave
         </button>
+        <div className="hint">
+          {role} · {peerCount} other{peerCount === 1 ? "" : "s"} connected
+        </div>
         {shareHint ? <div className="hint">{shareHint}</div> : null}
       </div>
     </>
