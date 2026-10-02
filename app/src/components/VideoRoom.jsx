@@ -47,11 +47,11 @@ export default function VideoRoom({ roomId }) {
   const callsRef = useRef(new Map());
   const connsRef = useRef(new Map());
   const myIdRef = useRef("");
+  const hostIdRef = useRef("");
   const rosterRef = useRef(new Set());
   const handRef = useRef(false);
   const sharingRef = useRef(false);
   const lastSeenRef = useRef(new Map());
-  const dropTimersRef = useRef(new Map());
 
   useEffect(() => {
     if (typeof window !== "undefined" && window.ethereum) {
@@ -64,10 +64,14 @@ export default function VideoRoom({ roomId }) {
   useEffect(() => {
     var dead = false;
     var retry;
-    var heartbeat;
+    var meshTick;
 
     function publishPeers() {
       setPeers(Array.from(peersRef.current.values()));
+    }
+
+    function isHost() {
+      return myIdRef.current && myIdRef.current === hostIdRef.current;
     }
 
     function broadcast(msg) {
@@ -79,21 +83,26 @@ export default function VideoRoom({ roomId }) {
       });
     }
 
-    function broadcastRoster() {
-      var ids = [myIdRef.current].concat(Array.from(rosterRef.current));
-      broadcast({ type: "roster", ids: ids });
+    function fullRoster() {
+      var ids = [];
+      if (myIdRef.current) ids.push(myIdRef.current);
+      rosterRef.current.forEach(function (id) {
+        if (id && ids.indexOf(id) === -1) ids.push(id);
+      });
+      return ids;
     }
 
-    function drop(id, announce) {
+    function broadcastRoster() {
+      broadcast({ type: "roster", ids: fullRoster(), host: isHost() });
+    }
+
+    function drop(id) {
       if (!id || id === myIdRef.current) return;
-      if (dropTimersRef.current.has(id)) {
-        clearTimeout(dropTimersRef.current.get(id));
-        dropTimersRef.current.delete(id);
-      }
       var had =
         peersRef.current.has(id) ||
         callsRef.current.has(id) ||
-        connsRef.current.has(id);
+        connsRef.current.has(id) ||
+        rosterRef.current.has(id);
       if (!had) return;
 
       try {
@@ -126,32 +135,15 @@ export default function VideoRoom({ roomId }) {
       });
       publishPeers();
 
-      if (announce) {
-        broadcast({ type: "leave", id: id });
-        if (myIdRef.current.indexOf("hm-") === 0) broadcastRoster();
-      }
-    }
-
-    function scheduleDrop(id) {
-      if (dropTimersRef.current.has(id)) return;
-      dropTimersRef.current.set(
-        id,
-        setTimeout(function () {
-          dropTimersRef.current.delete(id);
-          drop(id, true);
-        }, 2500)
-      );
+      if (isHost()) broadcastRoster();
     }
 
     function touch(id) {
-      lastSeenRef.current.set(id, Date.now());
-      if (dropTimersRef.current.has(id)) {
-        clearTimeout(dropTimersRef.current.get(id));
-        dropTimersRef.current.delete(id);
-      }
+      if (id) lastSeenRef.current.set(id, Date.now());
     }
 
     function upsert(id, stream) {
+      if (!id || id === myIdRef.current) return;
       touch(id);
       rosterRef.current.add(id);
       var prev = peersRef.current.get(id) || {};
@@ -163,12 +155,60 @@ export default function VideoRoom({ roomId }) {
       if (!pc) return;
       function check() {
         var s = pc.connectionState || pc.iceConnectionState;
-        if (s === "failed" || s === "closed") drop(id, true);
-        else if (s === "disconnected") scheduleDrop(id);
+        if (s === "failed" || s === "closed") drop(id);
         else if (s === "connected" || s === "completed") touch(id);
       }
-      pc.addEventListener("connectionstatechange", check);
-      pc.addEventListener("iceconnectionstatechange", check);
+      try {
+        pc.addEventListener("connectionstatechange", check);
+        pc.addEventListener("iceconnectionstatechange", check);
+      } catch (e) {}
+    }
+
+    // Only the lower peer id initiates the media call (avoids glare).
+    // Both sides still answer inbound calls.
+    function shouldInitiateCall(remoteId) {
+      if (!myIdRef.current || !remoteId) return false;
+      return myIdRef.current < remoteId;
+    }
+
+    function ensureData(peerId) {
+      var me = peerRef.current;
+      if (!me || !peerId || peerId === myIdRef.current) return;
+      var existing = connsRef.current.get(peerId);
+      if (existing && existing.open) return;
+      try {
+        var conn = me.connect(peerId, { reliable: true });
+        wireConn(conn);
+      } catch (e) {}
+    }
+
+    function ensureCall(peerId) {
+      var me = peerRef.current;
+      if (!me || !peerId || peerId === myIdRef.current) return;
+      if (!streamRef.current) return;
+      if (callsRef.current.has(peerId)) return;
+      if (!shouldInitiateCall(peerId)) return;
+      try {
+        var call = me.call(peerId, streamRef.current);
+        if (call) hookCall(call);
+      } catch (e) {}
+    }
+
+    function dialPeer(peerId) {
+      if (!peerId || peerId === myIdRef.current) return;
+      rosterRef.current.add(peerId);
+      ensureData(peerId);
+      ensureCall(peerId);
+    }
+
+    function meshAll() {
+      rosterRef.current.forEach(function (id) {
+        dialPeer(id);
+      });
+      // always keep link to room host id
+      if (hostIdRef.current && hostIdRef.current !== myIdRef.current) {
+        dialPeer(hostIdRef.current);
+      }
     }
 
     function handleData(from, raw) {
@@ -180,6 +220,7 @@ export default function VideoRoom({ roomId }) {
       }
       if (!msg || !msg.type) return;
       touch(from);
+      rosterRef.current.add(from);
 
       if (msg.type === "ping") {
         var c = connsRef.current.get(from);
@@ -191,27 +232,38 @@ export default function VideoRoom({ roomId }) {
       if (msg.type === "pong") return;
 
       if (msg.type === "leave") {
-        drop(msg.id || from, false);
+        drop(msg.id || from);
         return;
       }
 
       if (msg.type === "roster" && Array.isArray(msg.ids)) {
-        var set = {};
         msg.ids.forEach(function (id) {
           if (id && id !== myIdRef.current) {
-            set[id] = true;
+            rosterRef.current.add(id);
             dialPeer(id);
           }
         });
-        // Drop anyone we thought was here but host roster no longer lists
-        Array.from(peersRef.current.keys()).forEach(function (id) {
-          if (!set[id]) drop(id, false);
-        });
+        // Only trust removals from the room host's roster
+        if (msg.host || from === hostIdRef.current) {
+          var keep = {};
+          msg.ids.forEach(function (id) {
+            if (id) keep[id] = true;
+          });
+          keep[hostIdRef.current] = true;
+          Array.from(peersRef.current.keys()).forEach(function (id) {
+            if (!keep[id]) drop(id);
+          });
+        }
         return;
       }
 
       if (msg.type === "join") {
-        if (msg.id && msg.id !== myIdRef.current) dialPeer(msg.id);
+        if (msg.id && msg.id !== myIdRef.current) {
+          rosterRef.current.add(msg.id);
+          dialPeer(msg.id);
+        }
+        // host rebroadcasts full list so every guest learns every guest
+        if (isHost()) broadcastRoster();
         return;
       }
 
@@ -240,128 +292,117 @@ export default function VideoRoom({ roomId }) {
 
       if (msg.type === "hello") {
         rosterRef.current.add(from);
-        broadcast({ type: "join", id: myIdRef.current });
-        if (myIdRef.current.indexOf("hm-") === 0) broadcastRoster();
-        else
-          broadcast({
-            type: "roster",
-            ids: [myIdRef.current].concat(Array.from(rosterRef.current)),
-          });
+        dialPeer(from);
+        try {
+          var conn = connsRef.current.get(from);
+          if (conn && conn.open) {
+            conn.send(JSON.stringify({ type: "join", id: myIdRef.current }));
+            conn.send(
+              JSON.stringify({
+                type: "roster",
+                ids: fullRoster(),
+                host: isHost(),
+              })
+            );
+          }
+        } catch (e) {}
+        if (isHost()) broadcastRoster();
       }
     }
 
     function wireConn(conn) {
       if (!conn || !conn.peer) return;
-      var existing = connsRef.current.get(conn.peer);
+      var pid = conn.peer;
+      var existing = connsRef.current.get(pid);
       if (existing && existing !== conn && existing.open) {
         try {
           conn.close();
         } catch (e) {}
         return;
       }
-      connsRef.current.set(conn.peer, conn);
-      rosterRef.current.add(conn.peer);
-      touch(conn.peer);
+      connsRef.current.set(pid, conn);
+      rosterRef.current.add(pid);
+      touch(pid);
 
       conn.on("data", function (d) {
-        handleData(conn.peer, d);
+        handleData(pid, d);
       });
       conn.on("open", function () {
-        touch(conn.peer);
+        touch(pid);
         try {
           conn.send(JSON.stringify({ type: "hello" }));
+          conn.send(JSON.stringify({ type: "join", id: myIdRef.current }));
           conn.send(
             JSON.stringify({
               type: "roster",
-              ids: [myIdRef.current].concat(Array.from(rosterRef.current)),
+              ids: fullRoster(),
+              host: isHost(),
             })
           );
-          conn.send(JSON.stringify({ type: "join", id: myIdRef.current }));
           if (handRef.current) conn.send(JSON.stringify({ type: "hand", on: true }));
           if (sharingRef.current) conn.send(JSON.stringify({ type: "share", on: true }));
         } catch (e) {}
-        if (myIdRef.current.indexOf("hm-") === 0) broadcastRoster();
+        if (isHost()) broadcastRoster();
+        // After data is up, try media both directions as rules allow
+        dialPeer(pid);
       });
       conn.on("close", function () {
-        drop(conn.peer, true);
+        drop(pid);
       });
       conn.on("error", function () {
-        scheduleDrop(conn.peer);
+        // soft: mesh tick will retry
       });
     }
 
     function hookCall(call) {
       if (!call || !call.peer) return;
-      var prev = callsRef.current.get(call.peer);
+      var pid = call.peer;
+      var prev = callsRef.current.get(pid);
       if (prev && prev !== call) {
         try {
           prev.close();
         } catch (e) {}
       }
-      callsRef.current.set(call.peer, call);
-      touch(call.peer);
-      watchPc(call.peer, call.peerConnection);
+      callsRef.current.set(pid, call);
+      rosterRef.current.add(pid);
+      touch(pid);
+      watchPc(pid, call.peerConnection);
 
       call.on("stream", function (remote) {
-        upsert(call.peer, remote);
-        if (remote) {
-          remote.getTracks().forEach(function (t) {
-            t.addEventListener("ended", function () {
-              // if all tracks ended, peer likely left
-              var alive = remote.getTracks().some(function (x) {
-                return x.readyState === "live";
-              });
-              if (!alive) scheduleDrop(call.peer);
-            });
-          });
-        }
+        upsert(pid, remote);
       });
       call.on("close", function () {
-        drop(call.peer, true);
+        // keep roster; mesh tick may re-call. Only drop tile stream.
+        peersRef.current.delete(pid);
+        callsRef.current.delete(pid);
+        publishPeers();
       });
       call.on("error", function () {
-        scheduleDrop(call.peer);
+        callsRef.current.delete(pid);
       });
     }
 
-    function dialPeer(peerId) {
-      var me = peerRef.current;
-      if (!me || !peerId || peerId === myIdRef.current) return;
-
-      if (!connsRef.current.has(peerId) || (connsRef.current.get(peerId) && !connsRef.current.get(peerId).open)) {
-        try {
-          var conn = me.connect(peerId, { reliable: true });
-          wireConn(conn);
-        } catch (e) {}
-      }
-
-      if (!callsRef.current.has(peerId) && streamRef.current) {
-        try {
-          var call = me.call(peerId, streamRef.current);
-          if (call) hookCall(call);
-        } catch (e) {}
-      }
-    }
-
-    function attachPeer(p, isHost) {
+    function attachPeer(p, asHost) {
       peerRef.current = p;
       p.on("open", function (id) {
         if (dead) return;
         myIdRef.current = id;
-        setRole(isHost ? "host" : "guest");
+        setRole(asHost ? "host" : "guest");
         setStatus("live");
+        if (!asHost) {
+          dialPeer(hostIdRef.current);
+        }
       });
       p.on("connection", function (conn) {
         wireConn(conn);
       });
       p.on("call", function (call) {
-        call.answer(streamRef.current);
+        // Always answer so we receive their stream and send ours
+        try {
+          call.answer(streamRef.current || new MediaStream());
+        } catch (e) {}
         hookCall(call);
-        if (!connsRef.current.has(call.peer) || !connsRef.current.get(call.peer).open) {
-          try {
-            wireConn(p.connect(call.peer, { reliable: true }));
-          } catch (e) {}
-        }
+        ensureData(call.peer);
       });
       p.on("disconnected", function () {
         try {
@@ -404,7 +445,8 @@ export default function VideoRoom({ roomId }) {
 
       var PeerMod = await import("peerjs");
       var Peer = PeerMod.default;
-      var hostId = ("hm-" + roomId).slice(0, 50);
+      var hostId = ("hm-" + String(roomId)).slice(0, 50);
+      hostIdRef.current = hostId;
       setStatus("signaling");
 
       var asHost = new Peer(hostId);
@@ -413,31 +455,34 @@ export default function VideoRoom({ roomId }) {
           setStatus(String((err && err.type) || err || "error"));
           return;
         }
-        asHost.destroy();
+        try {
+          asHost.destroy();
+        } catch (e) {}
         var guest = new Peer();
         attachPeer(guest, false);
         guest.on("open", function () {
           dialPeer(hostId);
           retry = setInterval(function () {
-            if (!dead) dialPeer(hostId);
-          }, 4000);
+            if (!dead) {
+              dialPeer(hostId);
+              meshAll();
+            }
+          }, 3000);
         });
       });
       attachPeer(asHost, true);
 
-      // Heartbeat: ping peers; drop if silent too long
-      heartbeat = setInterval(function () {
+      // Keep mesh healthy: re-dial missing links, expire silent peers
+      meshTick = setInterval(function () {
         if (dead) return;
-        var now = Date.now();
         broadcast({ type: "ping" });
+        if (isHost()) broadcastRoster();
+        meshAll();
+        var now = Date.now();
         lastSeenRef.current.forEach(function (ts, id) {
-          if (now - ts > 12000) drop(id, true);
+          if (now - ts > 20000) drop(id);
         });
-        // also re-dial anyone in roster missing a call
-        rosterRef.current.forEach(function (id) {
-          if (!peersRef.current.has(id)) dialPeer(id);
-        });
-      }, 4000);
+      }, 5000);
 
       window.addEventListener("pagehide", announceLeave);
       window.addEventListener("beforeunload", announceLeave);
@@ -447,11 +492,14 @@ export default function VideoRoom({ roomId }) {
     return function () {
       dead = true;
       clearInterval(retry);
-      clearInterval(heartbeat);
+      clearInterval(meshTick);
       try {
         broadcast({ type: "leave", id: myIdRef.current });
       } catch (e) {}
-      window.removeEventListener("pagehide", function () {});
+      try {
+        window.removeEventListener("pagehide", announceLeave);
+        window.removeEventListener("beforeunload", announceLeave);
+      } catch (e) {}
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(function (t) {
           t.stop();
